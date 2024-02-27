@@ -5,7 +5,7 @@
 
 # Configuration and Connection Details
 $server = "10.95.0.26,17001"
-#$server="GLDDS85455"i
+#$server="GLDDS85455"
 # Flag for Windows Authentication
 $useWindowsAuthentication = $false  # Change to $true if you want to use Windows Authentication
 
@@ -172,6 +172,17 @@ WHERE princ.type IN ('S','U','G') AND (princ.name LIKE '$LoginNamePattern' OR ul
 }
 
  
+pdated function for checking login existence using Invoke-DbaQuery
+function Check-LoginExistence {
+    param(
+        $Server,
+        $Credential,
+        $LoginNamePattern
+    )
+    $query = "SELECT name FROM sys.server_principals WHERE name LIKE '$LoginNamePattern';"
+    $result = Invoke-DbaQuery -SqlInstance $Server -SqlCredential $Credential -Database 'master' -Query $query
+    return $result
+}
 # Define the function for creating a login
 function Create-Login {
     param($Server, $Credential, $LoginName, $Password, $LoginNamePattern)
@@ -191,17 +202,7 @@ function Create-Login {
         Write-Output "Login $LoginName created."
     }
 }
-# Updated function for checking login existence using Invoke-DbaQuery
-function Check-LoginExistence {
-    param(
-        $Server,
-        $Credential,
-        $LoginName
-    )
-    $query = "SELECT name FROM sys.server_principals WHERE name = '$LoginName';"
-    $result = Invoke-DbaQuery -SqlInstance $Server -SqlCredential $Credential -Query $query
-    return $result
-}
+# U
 # Define the function for dropping a login
 function Drop-Login {
     param(
@@ -221,8 +222,15 @@ function Drop-Login {
     # If createNewLoginFlag is on, do not proceed with dropping the login
     if ($createNewLoginFlag) {
         Write-Output "Cannot drop login $LoginName because createNewLoginFlag is set to true."
-        return
-    }
+    return
+  }
+
+  # Confirm before dropping login
+  $confirmChoice = Read-Host "Are you sure you want to drop the login '$LoginName'? (y/n)"
+  if ($confirmChoice.ToLower() -ne 'y') {
+    Write-Output "Login drop cancelled."
+    return
+  }
 
     # If service account, first remove from the specific table
     if ($IsServiceAccount) {
@@ -242,12 +250,10 @@ function Reset-Password {
     $resetPasswordQuery = "ALTER LOGIN [$LoginName] WITH PASSWORD = N'$Password';"
     Execute-Query -Server $Server -Credential $Credential -Database 'master' -Query $resetPasswordQuery
     Write-Output "Password for $LoginName reset."
-    
-    # Enable and unlock the account after resetting the password
-    Enable-Account -Server $Server -Credential $Credential -LoginName $LoginName
-    Unlock-Account -Server $Server -Credential $Credential -LoginName $LoginName
-    
-     Write-Output "Login $LoginName Unlocked."
+    Manage-AccountStatus -Server $Server -Credential $Credential -LoginName $LoginName -Action 'Enable'
+    Manage-AccountStatus -Server $Server -Credential $Credential -LoginName $LoginName -Action 'Unluck'
+ 
+    Write-Output "Login $LoginName enabled (and unlocked if it was locked)."
 }
 
 function Manage-AccountStatus {
@@ -260,32 +266,40 @@ function Manage-AccountStatus {
     )
     switch ($Action) {
         'Unlock' {
-            $query = "ALTER LOGIN [$LoginName] WITH CHECK_POLICY = OFF; ALTER LOGIN [$LoginName] WITH CHECK_POLICY = ON;"
-            Write-Output "Login $LoginName unlocked."
+            # Temporarily disable password policy checks to effectively "unlock" the account
+            $disableCheckPolicyQuery = "ALTER LOGIN [$LoginName] WITH CHECK_POLICY = OFF;"
+            Execute-Query -Server $Server -Credential $Credential -Database 'master' -Query $disableCheckPolicyQuery
+
+            # Re-enable password policy checks
+            $enableCheckPolicyQuery = "ALTER LOGIN [$LoginName] WITH CHECK_POLICY = ON;"
+            Execute-Query -Server $Server -Credential $Credential -Database 'master' -Query $enableCheckPolicyQuery
+
+            Write-Output "Account $LoginName unlocked by toggling CHECK_POLICY."
         }
         'Disable' {
-            $query = "ALTER LOGIN [$LoginName] DISABLE;"
+            $disableLoginQuery = "ALTER LOGIN [$LoginName] DISABLE;"
+            Execute-Query -Server $Server -Credential $Credential -Database 'master' -Query $disableLoginQuery
             Write-Output "Login $LoginName disabled."
         }
         'Enable' {
-            $query = "ALTER LOGIN [$LoginName] ENABLE;"
+            $enableLoginQuery = "ALTER LOGIN [$LoginName] ENABLE;"
+            Execute-Query -Server $Server -Credential $Credential -Database 'master' -Query $enableLoginQuery
             Write-Output "Login $LoginName enabled."
         }
     }
-    Execute-Query -Server $Server -Credential $Credential -Database 'master' -Query $query
 }
 
 # Define the function for granting database permissions
 function Grant-DatabasePermissions {
     param($Server, $Credential, $LoginName, $DatabaseAccessList, $dbRoleNames)
-    if ($DatabaseAccessList -eq "all") {
+    if ($DatabaseAccessList -eq "all" -or $DatabaseAccessList -eq "ALL") {
         $DatabaseAccessList = Invoke-DbaQuery -SqlInstance $Server -SqlCredential $Credential -Query "SELECT name FROM sys.databases WHERE database_id > 4 AND state = 0" | ForEach-Object { $_.name }
     }
-    foreach ($Database in $DatabaseAccessList) {
+    foreach ($DatabaseName in $DatabaseAccessList) {
         foreach ($Role in $dbRoleNames) {
-            $grantPermissionsQuery = "EXEC sp_addrolemember '$Role','$LoginName'"
-            Execute-Query -Server $Server -Credential $Credential -Database $Database -Query $grantPermissionsQuery
-                    Write-Output "Granted $Role role to $LoginName in $Database."
+	    $addRoleMemberQuery = "EXEC sp_addrolemember  '$Role','$LoginName';"
+	           Execute-Query -Server $Server -Credential $Credential -Database $DatabaseName -Query $addRoleMemberQuery
+		   Write-Output "Granted $Role role to $LoginName in $DatabaseName."
 
 	}
 	
@@ -294,14 +308,20 @@ function Grant-DatabasePermissions {
 
 # Define the function for revoking database permissions
 function Revoke-DatabasePermissions {
-    param($Server, $Credential, $LoginName, $DatabaseAccessList, $dbRoleNames)
-    if ($DatabaseAccessList -eq "all") {
+    param(
+        $Server, 
+        $Credential, 
+        $LoginName, 
+        $DatabaseAccessList,  # Can be 'ALL' or an array of database names
+        $DbRoleNames  # Array of role names
+    )
+    if ($DatabaseAccessList -eq "all" -or $DatabaseAccessList -eq "ALL") {
         $DatabaseAccessList = Invoke-DbaQuery -SqlInstance $Server -SqlCredential $Credential -Query "SELECT name FROM sys.databases WHERE database_id > 4 AND state = 0" | ForEach-Object { $_.name }
     }
-    foreach ($Database in $DatabaseAccessList) {
+    foreach ($DatabaseName in $DatabaseAccessList) {
         foreach ($Role in $dbRoleNames) {
             $revokePermissionsQuery = "EXEC sp_droprolemember '$Role','$LoginName'"
-            Execute-Query -Server $Server -Credential $Credential -Database $Database -Query $revokePermissionsQuery
+	Execute-Query -Server $Server -Credential $Credential -Database $DatabaseName -Query $revokePermissionsQuery
         }
     }
 }
@@ -314,38 +334,60 @@ function Grant-SchemaPermissions {
         $LoginName,
         $SchemaAccessList,
         $SchemaPermissionList,
-        $DatabaseName  # Added parameter for database name
+        $DatabaseAccessList  # Now expecting a list of databases or 'ALL'
     )
-    foreach ($Schema in $SchemaAccessList) {
-        foreach ($Permission in $SchemaPermissionList) {
-            $checkSchemaQuery = "SELECT 1 FROM sys.schemas WHERE name = '$Schema';"
-            $schemaExists = Execute-Query -Server $Server -Credential $Credential -Database $DatabaseName -Query $checkSchemaQuery
-            if ($schemaExists.Count -eq 0) {
-                Write-Host "Schema '$Schema' does not exist in database '$DatabaseName'. Skipping permission grant for $LoginName."
-            } else {
-                $grantSchemaPermissionsQuery = "GRANT $Permission ON SCHEMA::$Schema TO [$LoginName];"
-                Execute-Query -Server $Server -Credential $Credential -Database $DatabaseName -Query $grantSchemaPermissionsQuery
-                Write-Host "Granted $Permission permission on schema $Schema to $LoginName in database $DatabaseName."
+    if ($DatabaseAccessList -eq "ALL") {
+        $DatabaseAccessList = Invoke-DbaQuery -SqlInstance $Server -SqlCredential $Credential -Query "SELECT name FROM sys.databases WHERE database_id > 4 AND state = 0" | ForEach-Object { $_.name }
+    }
+
+    foreach ($DatabaseName in $DatabaseAccessList) {
+        foreach ($Schema in $SchemaAccessList) {
+            foreach ($Permission in $SchemaPermissionList) {
+                try {
+                    $checkSchemaQuery = "SELECT 1 FROM sys.schemas WHERE name = '$Schema';"
+                    $schemaExists = Execute-Query -Server $Server -Credential $Credential -Database $DatabaseName -Query $checkSchemaQuery
+                    if ($schemaExists.Count -eq 0) {
+                        Write-Verbose "Schema '$Schema' does not exist in database '$DatabaseName'. Skipping permission grant for $LoginName."
+                    } else {
+                        $grantSchemaPermissionsQuery = "GRANT $Permission ON SCHEMA::$Schema TO [$LoginName];"
+                        Execute-Query -Server $Server -Credential $Credential -Database $DatabaseName -Query $grantSchemaPermissionsQuery
+                        Write-Output "Granted $Permission permission on schema $Schema to $LoginName in database $DatabaseName."
+                    }
+                } catch {
+                    Write-Error "An error occurred: $_"
+                }
             }
         }
     }
 }
 
+
 # Define the function for granting object permissions
 function Grant-ObjectPermissions {
-    param($Server, $Credential, $LoginName, $ObjectAccessList, $PermissionObjectAccessList)
-    foreach ($Object in $ObjectAccessList) {
-        foreach ($Permission in $PermissionObjectAccessList) {
+param(
+        $Server,
+        $Credential,
+        $LoginName,
+        $ObjectAccessList,
+        $PermissionObjectAccessList,
+        $DatabaseAccessList  # Now expecting a list of databases or 'ALL'
+    )
+    if ($DatabaseAccessList -eq "ALL") {
+        $DatabaseAccessList = Invoke-DbaQuery -SqlInstance $Server -SqlCredential $Credential -Query "SELECT name FROM sys.databases WHERE database_id > 4 AND state = 0" | ForEach-Object { $_.name }
+    }
+    foreach ($DatabaseName in $DatabaseAccessList) {
+        foreach ($Object in $ObjectAccessList) {
+            foreach ($Permission in $PermissionObjectAccessList) {
             # Check if the object exists
             $checkObjectQuery = "SELECT 1 FROM sys.objects WHERE name = '$Object';"
             $objectExists = Execute-Query -Server $Server -Credential $Credential -Database 'master' -Query $checkObjectQuery
             if ($objectExists) {
                 $grantObjectPermissionsQuery = "GRANT $Permission ON $Object TO [$LoginName];"
-                Execute-Query -Server $Server -Credential $Credential -Database 'master' -Query $grantObjectPermissionsQuery
-		            Write-Output "Granted $Permission permission on $Object to $LoginName in $Database."
+                Execute-Query -Server $Server -Credential $Credential -Database $DatabaseName -Query $grantObjectPermissionsQuery
+                Write-Output "Granted $Permission permission on $Object to $LoginName in database $DatabaseName."
 
             } else {
-                Write-Host "Object '$Object' does not exist. Skipping permission grant."
+                Write-Output "Object '$Object' does not exist. Skipping permission grant."
             }
         }
     }
@@ -457,83 +499,104 @@ function Manage-Login {
         $ObjectAccessList, 
         $PermissionObjectAccessList,
         $DatabaseAccessList, 
-        $DbRoleNames
+        $DbRoleNames,
+        $LoginNamePattern,
+        $ReportFlag,
+        $createNewLoginFlag,
+        $resetPasswordFlag,
+        $unlockAccountFlag,
+        $disableLoginFlag,
+        $enableLoginFlag,
+        $deleteLoginFlag,
+        $sendEmailFlag,
+        $ccAddress
     )
     $ActionDetails = ""
     $ActionType = ""
-    $SendEmail = $false  # Initialize SendEmail flag to false
+    $SendEmail = $false
 
     # Handle report generation
     if ($ReportFlag) {
-        Generate-Report -Server $Server -Credential $Credential -LoginNamePattern $LoginNamePattern -ReportFlag $ReportFlag
+        Generate-Report -Server $Server -Credential $Credential -LoginNamePattern $LoginNamePattern
         return
     }
 
-    # Process for creating new login and service account
-    if ($createNewLoginFlag) {
-        $existingLogin = Get-DbaLogin -SqlInstance $Server -SqlCredential $Credential -Login $LoginName
-        if (-not $existingLogin) {
-            Create-Login -Server $Server -Credential $Credential -LoginName $LoginName -Password $Password
-            $ActionDetails += "Login '$LoginName' created.`n"
-            $ActionType = "CreateLogin"
-            $SendEmail = $true  # Set SendEmail to true for new login creation
-            
-            if ($IsServiceAccount) {
-                $insertQuery = "INSERT INTO APSAccountInfo.dbo.APSserviceAccounts_DBA (POC, name, LoadDate) VALUES ('$requesterEmail', '$LoginName', '$date')"
-                Execute-Query -Server $Server -Credential $Credential -Database 'master' -Query $insertQuery
-                $ActionDetails += "Service account for '$LoginName' created.`n"
-                $ActionType += "/ServiceAccountCreation"
-            }
+    # Check for existing logins
+    $existingLogins = Check-LoginExistence -Server $Server -Credential $Credential -LoginNamePattern $LoginNamePattern
+    if ($existingLogins.Count -gt 0) {
+        Write-Output "Existing logins found matching pattern '$LoginNamePattern':"
+        $existingLogins | ForEach-Object { Write-Output $_.name }
+    } else {
+        Write-Output "No existing logins found matching pattern '$LoginNamePattern'."
+    }
 
-            Grant-DatabasePermissions -Server $Server -Credential $Credential -LoginName $LoginName -DatabaseAccessList $DatabaseAccessList -DbRoleNames $DbRoleNames
-            Grant-SchemaPermissions -Server $Server -Credential $Credential -LoginName $LoginName -SchemaAccessList $SchemaAccessList -SchemaPermissionList $SchemaPermissionList
-            Grant-ObjectPermissions -Server $Server -Credential $Credential -LoginName $LoginName -ObjectAccessList $ObjectAccessList -PermissionObjectAccessList $PermissionObjectAccessList
+    # Create new login and service account if no existing logins match
+    if ($createNewLoginFlag -and $existingLogins.Count -eq 0) {
+        Create-Login -Server $Server -Credential $Credential -LoginName $LoginName -Password $Password
+        $ActionDetails += "Login '$LoginName' created.`n"
+        $ActionType = "CreateLogin"
+        $SendEmail = $true
+        
+        if ($IsServiceAccount) {
+            $insertQuery = "INSERT INTO APSAccountInfo.dbo.APSserviceAccounts_DBA (POC, name, LoadDate) VALUES ('$requesterEmail', '$LoginName', '$date')"
+            Execute-Query -Server $Server -Credential $Credential -Database 'master' -Query $insertQuery
+            $ActionDetails += "Service account for '$LoginName' created.`n"
+            $ActionType += "/ServiceAccountCreation"
+        }
+
+        Grant-DatabasePermissions -Server $Server -Credential $Credential -LoginName $LoginName -DatabaseAccessList $DatabaseAccessList -DbRoleNames $DbRoleNames
+        Grant-SchemaPermissions -Server $Server -Credential $Credential -LoginName $LoginName -SchemaAccessList $SchemaAccessList -SchemaPermissionList $SchemaPermissionList
+        Grant-ObjectPermissions -Server $Server -Credential $Credential -LoginName $LoginName -ObjectAccessList $ObjectAccessList -PermissionObjectAccessList $PermissionObjectAccessList
+    }
+
+    # Reset password logic with confirmation
+    if ($resetPasswordFlag) {
+        $confirmReset = Read-Host "Are you sure you want to reset the password for $LoginName? (y/n)"
+        if ($confirmReset -eq 'y') {
+            Reset-Password -Server $Server -Credential $Credential -LoginName $LoginName -Password $resetPassword
+            $ActionDetails += "Password for '$LoginName' reset.`n"
+            $ActionType = "ResetPassword"
+            $SendEmail = $true
         } else {
-            $ActionDetails += "Login '$LoginName' already exists.`n"
+            Write-Output "Password reset cancelled."
         }
     }
 
-    # Handle reset password, unlock, disable, enable, and delete login actions here
-
-    if ($resetPasswordFlag) {
-        Reset-Password -Server $Server -Credential $Credential -LoginName $LoginName -Password $resetPassword
-    $ActionDetails += "Password for '$LoginName' reset.`n"
-         $ActionType = "ResetPassword"
-        $SendEmail = $tru
-    }
-
-    # Perform actions without email notifications
-    if ($unlockAccountFlag) {
-Manage-AccountStatus -Server $server -Credential $credential -LoginName $LoginName -Action 'Unlock'
+    # Unlock, disable, enable, and delete login actions
+    if ($unlockAccountFlag -and !$createNewLoginFlag) {
+        Manage-AccountStatus -Server $Server -Credential $Credential -LoginName $LoginName -Action 'Unlock'
         $ActionDetails += "'$LoginName' account unlocked.`n"
     }
 
-    if ($disableLoginFlag) {
-Manage-AccountStatus -Server $server -Credential $credential -LoginName $LoginName -Action 'Disable'
+    if ($disableLoginFlag -and !$createNewLoginFlag) {
+        Manage-AccountStatus -Server $Server -Credential $Credential -LoginName $LoginName -Action 'Disable'
         $ActionDetails += "'$LoginName' login disabled.`n"
     }
 
-    if ($enableLoginFlag) {
-Manage-AccountStatus -Server $server -Credential $credential -LoginName $LoginName -Action 'Enable'
+    if ($enableLoginFlag -and !$createNewLoginFlag) {
+        Manage-AccountStatus -Server $Server -Credential $Credential -LoginName $LoginName -Action 'Enable'
         $ActionDetails += "'$LoginName' login enabled.`n"
     }
 
-    if ($deleteLoginFlag) {
-        Drop-Login -Server $Server -Credential $Credential -LoginName $LoginName
-        $ActionDetails += "'$LoginName' login deleted.`n"
+    if ($deleteLoginFlag -and !$createNewLoginFlag) {
+        $confirmDelete = Read-Host "Are you sure you want to delete the login '$LoginName'? (y/n)"
+        if ($confirmDelete -eq 'y') {
+            Drop-Login -Server $Server -Credential $Credential -LoginName $LoginName
+            $ActionDetails += "'$LoginName' login deleted.`n"
+        } else {
+            Write-Output "Login deletion cancelled."
+        }
     }
 
-    # Send email if needed and for specific actions
+    # Send email notification for specific actions
     if ($sendEmailFlag -and $SendEmail -and ($ActionType -eq "CreateLogin" -or $ActionType -eq "ResetPassword")) {
-
-            Send-EmailNotification -Server $Server -ActionDetails $ActionDetails -ccAddress $ccAddress -ActionType $ActionType
+        Send-EmailNotification -Server $Server -ActionDetails $ActionDetails -ccAddress $ccAddress -ActionType $ActionType
     }
-
-    }
+}
 
 # Main execution logic
 if ($ReportFlag) {
     Generate-Report -Server $server -Credential $credential -LoginNamePattern $LoginNamePattern -ReportFlag $ReportFlag
 } else {
-    Manage-Login -Server $server -Credential $credential -LoginName $LoginName -Password $newLoginPassword -IsServiceAccount $createServiceAccountFlag -SchemaAccessList $schemaAccessList -SchemaPermissionList $schemaPermissionList -ObjectAccessList $objectAccessList -PermissionObjectAccessList $permissionObjectAccessList -DatabaseAccessList $databaseAccessList -DbRoleNames $dbRoleNames
+    Manage-Login -Server $server -Credential $credential -LoginName $LoginName -Password $newLoginPassword -IsServiceAccount $createServiceAccountFlag -SchemaAccessList $schemaAccessList -SchemaPermissionList $schemaPermissionList -ObjectAccessList $objectAccessList -PermissionObjectAccessList $permissionObjectAccessList -DatabaseAccessList $databaseAccessList -DbRoleNames $dbRoleNames -LoginNamePattern $LoginNamePattern -ReportFlag $ReportFlag -createNewLoginFlag $createNewLoginFlag -resetPasswordFlag $resetPasswordFlag -unlockAccountFlag $unlockAccountFlag -disableLoginFlag $disableLoginFlag -enableLoginFlag $enableLoginFlag -deleteLoginFlag $deleteLoginFlag -sendEmailFlag $sendEmailFlag -ccAddress $ccAddress
 }
